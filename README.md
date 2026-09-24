@@ -21,7 +21,17 @@ The VPS runs `relay.py` as `frincoms-relay.service`. Check its status with `ssh 
 
 ## Standalone builds
 
-Build separately on Windows and macOS:
+### Windows: one script
+
+1. Sign in to GitHub and download [build-windows.ps1](build-windows.ps1) from this private repository (open the file and click **Download raw file**). Save it to Downloads.
+2. Open **PowerShell** in Downloads and run `powershell -NoProfile -ExecutionPolicy Bypass -File .\build-windows.ps1`. The script installs Git, GitHub CLI, and Python 3.12 with `winget` if missing; GitHub sign-in opens in a browser on first use. It then clones/updates the repo, installs dependencies in a local environment, runs tests, and builds the executable.
+3. Open `%USERPROFILE%\frincoms\dist\Frincoms.exe`. Rerun the same script to update and rebuild. To choose a different checkout folder, append `-Destination "C:\path\to\frincoms"`.
+
+Windows may ask you to confirm installations or allow the app through its security prompt. `winget` (Microsoft App Installer) and an internet connection are needed. GitHub access to the private repository is required.
+
+### Manual build / macOS
+
+Build separately on each operating system:
 
 ```sh
 python -m pip install -r requirements.txt pyinstaller
