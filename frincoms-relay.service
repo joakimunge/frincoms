@@ -1,0 +1,19 @@
+[Unit]
+Description=Frincoms voice relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=frincoms
+Group=frincoms
+ExecStart=/usr/bin/python3 /opt/frincoms/relay.py --cert /etc/frincoms/relay.crt --key /etc/frincoms/relay.key
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
