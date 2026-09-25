@@ -42,7 +42,15 @@ Artifacts are retained for 30 days. The build runs the tests on Windows before u
 
 Windows may ask you to confirm installations or allow the app through its security prompt. `winget` (Microsoft App Installer) and an internet connection are needed. GitHub access to the private repository is required.
 
-### Linux: Docker build
+### Linux: download the GitHub Actions build
+
+1. While signed in to GitHub, open [Actions → Build Linux app](https://github.com/joakimunge/frincoms/actions/workflows/linux-build.yml). Choose the latest successful run on `main`, or click **Run workflow**.
+2. Under **Artifacts**, download `Frincoms-Linux-x64`. Extract the downloaded ZIP, then extract `Frincoms-Linux-x64.tar.gz` on an x86-64 Linux desktop with `tar -xzf Frincoms-Linux-x64.tar.gz`.
+3. Run `./Frincoms/Frincoms`. Keep the entire `Frincoms` directory, including `_internal`. Python is not required on the destination machine.
+
+Artifacts are retained for 30 days. The workflow runs the tests and opens the packaged app under a virtual display before uploading it.
+
+### Linux: Docker build locally
 
 From this repository, with Docker running:
 
