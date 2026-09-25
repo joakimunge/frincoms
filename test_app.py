@@ -1,8 +1,11 @@
 """Shared-room connection and settings checks without an audio device."""
 
 import hashlib
+import logging
 import queue
+import shutil
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -13,6 +16,7 @@ from unittest.mock import patch
 
 import app
 import audio_devices
+import client_log
 import relay
 import settings
 import numpy as np
@@ -58,6 +62,34 @@ class SettingsTests(unittest.TestCase):
             self.assertTrue(settings.valid_relay_host(address), address)
         for address in ("", " https://relay.example.org", "relay.example.org:38452", "bad host", "relay..org"):
             self.assertFalse(settings.valid_relay_host(address), address)
+
+
+class ClientLogTests(unittest.TestCase):
+    def test_local_log_records_connection_failure(self):
+        with TemporaryDirectory() as folder:
+            log_file = Path(folder) / "frincoms.log"
+            diagnostic_logger = client_log.setup_logging(log_file)
+            instance = app.VoiceApp.__new__(app.VoiceApp)
+            instance.lock = threading.Lock()
+            instance.generation = 1
+            instance.stop_event = threading.Event()
+            instance.connection = None
+            events = []
+            instance.post = lambda generation, kind, message: events.append((kind, message))
+            try:
+                with patch.object(app, "logger", diagnostic_logger), \
+                     patch.object(app.socket, "create_connection", side_effect=ConnectionRefusedError("refused")):
+                    retry, connected = instance.run_relay(1, instance.stop_event, "localhost")
+                self.assertTrue(retry)
+                self.assertFalse(connected)
+                self.assertIn(("retry", "Connection failed: refused. Reconnecting…"), events)
+                contents = log_file.read_text(encoding="utf-8")
+                self.assertIn("Connection failed", contents)
+                self.assertIn("ConnectionRefusedError", contents)
+            finally:
+                for handler in diagnostic_logger.handlers[:]:
+                    diagnostic_logger.removeHandler(handler)
+                    handler.close()
 
 
 class AudioDeviceTests(unittest.TestCase):
@@ -210,6 +242,7 @@ class RelayTests(unittest.TestCase):
             instance.post = lambda generation, kind, message: results.append((kind, message))
 
             def call(generation, stop, connection):
+                self.assertIsNone(connection.gettimeout())
                 frame = struct.pack("<960h", *([100] * 960))
                 observed = set()
                 for _ in range(18):
@@ -252,6 +285,131 @@ class RelayTests(unittest.TestCase):
         self.assertIn(("connected", "Connected to relay. Waiting for others…"), results)
         self.assertIn(("count", 1), results)
         self.assertFalse(any("Connection failed" in message for _, message in results if isinstance(message, str)), results)
+
+    def test_retry_after_failure_then_reconnect(self):
+        instance = app.VoiceApp.__new__(app.VoiceApp)
+        instance.generation = 1
+        stop = threading.Event()
+        events = []
+        attempts = []
+        instance.post = lambda generation, kind, message: events.append((kind, message))
+
+        def attempt(generation, event, host):
+            attempts.append(host)
+            if len(attempts) == 2:
+                event.set()
+            return True, False
+
+        instance.run_relay = attempt
+        with patch.object(app, "MAX_RETRY_DELAY", 2):
+            instance.reconnect_loop(1, stop, "localhost")
+        self.assertEqual(attempts, ["localhost", "localhost"])
+        self.assertIn(("retry", "Connection lost. Reconnecting in 1s…"), events)
+
+    def test_manual_disconnect_cancels_pending_retry(self):
+        instance = app.VoiceApp.__new__(app.VoiceApp)
+        instance.generation = 1
+        stop = threading.Event()
+        scheduled = threading.Event()
+        attempts = []
+
+        def post(generation, kind, message):
+            if "in 1s" in message:
+                scheduled.set()
+
+        instance.post = post
+        instance.run_relay = lambda generation, event, host: (attempts.append(host) or True, False)
+        worker = threading.Thread(target=instance.reconnect_loop, args=(1, stop, "localhost"))
+        worker.start()
+        self.assertTrue(scheduled.wait(2))
+        stop.set()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(attempts, ["localhost"])
+
+    def test_retries_back_off_and_reset_after_rejoining(self):
+        instance = app.VoiceApp.__new__(app.VoiceApp)
+        instance.generation = 1
+        events = []
+        instance.post = lambda generation, kind, message: events.append(message)
+        attempts = iter([(True, False)] * 5 + [(True, True), (True, True)])
+        instance.run_relay = lambda generation, stop, host: next(attempts)
+
+        class StopAfterSevenWaits:
+            delays = []
+
+            def is_set(self):
+                return len(self.delays) == 7
+
+            def wait(self, delay):
+                self.delays.append(delay)
+                return False
+
+        stop = StopAfterSevenWaits()
+        instance.reconnect_loop(1, stop, "localhost")
+        self.assertEqual(stop.delays, [1, 2, 4, 8, 10, 1, 2])
+        self.assertIn("Connection lost. Reconnecting in 10s…", events)
+
+    def test_tls_idle_reader_can_be_stopped_by_closing_socket(self):
+        # Mirrors a real SSLSocket blocking between voice frames: stopping the
+        # call must unblock it even when no data is arriving.
+        if not shutil.which("openssl"):
+            self.skipTest("OpenSSL CLI is not installed")
+        with TemporaryDirectory() as folder:
+            cert = Path(folder) / "cert.pem"
+            key = Path(folder) / "key.pem"
+            import subprocess
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "ec",
+                            "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+                            "-days", "1", "-keyout", str(key), "-out", str(cert),
+                            "-subj", "/CN=localhost"], check=True, capture_output=True)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(str(cert), str(key))
+            listener = socket.socket()
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            waiting = threading.Event()
+            finished = threading.Event()
+
+            def reader():
+                try:
+                    app.receive_exact(client, 1, threading.Event())
+                except (OSError, ConnectionError):
+                    pass
+                finally:
+                    finished.set()
+
+            try:
+                client_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                client_context.check_hostname = False
+                client_context.verify_mode = ssl.CERT_NONE
+
+                def accept():
+                    nonlocal server
+                    raw, _ = listener.accept()
+                    server = context.wrap_socket(raw, server_side=True)
+                    waiting.set()
+
+                server = None
+                accept_thread = threading.Thread(target=accept)
+                accept_thread.start()
+                client = client_context.wrap_socket(
+                    socket.create_connection(listener.getsockname()), server_hostname="localhost"
+                )
+                self.assertTrue(waiting.wait(2))
+                client.settimeout(None)
+                worker = threading.Thread(target=reader)
+                worker.start()
+                time.sleep(0.05)
+                self.assertFalse(finished.is_set())
+                app.close_socket(client)
+                self.assertTrue(finished.wait(2))
+                worker.join(2)
+                accept_thread.join(2)
+            finally:
+                if server is not None:
+                    app.close_socket(server)
+                listener.close()
 
 
 if __name__ == "__main__":

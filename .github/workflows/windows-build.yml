@@ -1,0 +1,47 @@
+name: Build Windows app
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+
+      - name: Install build dependencies
+        run: python -m pip install -r requirements.txt pyinstaller
+
+      - name: Run tests
+        run: python -m unittest -v test_app
+
+      - name: Build Windows executable
+        run: python -m PyInstaller --clean --noconfirm frincoms.spec
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'dist/Frincoms.exe')) {
+            throw 'PyInstaller did not produce dist/Frincoms.exe'
+          }
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: Frincoms-Windows-x64
+          path: dist/Frincoms.exe
+          if-no-files-found: error
+          retention-days: 30

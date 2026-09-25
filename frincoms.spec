@@ -25,8 +25,11 @@ if sys.platform == 'darwin':
         bundle_identifier='com.frincoms.app',
         info_plist={'NSMicrophoneUsageDescription': 'Frincoms uses your microphone for voice calls.'},
     )
-else:
+elif sys.platform == 'win32':
     exe = EXE(
         pyz, a.scripts, a.binaries, a.datas, [],
         name='Frincoms', console=False, onefile=True,
     )
+else:
+    exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name='Frincoms', console=False)
+    coll = COLLECT(exe, a.binaries, a.datas, name='Frincoms')

@@ -1,0 +1,18 @@
+FROM debian:bookworm-slim
+
+# Debian's Python and Tk packages must match for PyInstaller to collect Tk.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-venv python3-tk libpython3.11 libportaudio2 libasound2 binutils xvfb xauth \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+WORKDIR /src
+COPY requirements.txt ./
+RUN python -m pip install --no-cache-dir -r requirements.txt pyinstaller
+
+COPY app.py audio_devices.py client_log.py settings.py relay_config.py frincoms.spec test_app.py relay.py ./
+RUN python -c "import tkinter, sounddevice; print('Tk and PortAudio available')" \
+    && python -m unittest -q test_app \
+    && python -m PyInstaller --clean --noconfirm frincoms.spec \
+    && sh -c 'timeout 5 xvfb-run -a /src/dist/Frincoms/Frincoms; code=$?; test "$code" -eq 124'

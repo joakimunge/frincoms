@@ -2,10 +2,14 @@
 
 import hashlib
 import hmac
+import logging
+import os
 import queue
 import socket
 import ssl
 import struct
+import subprocess
+import sys
 import threading
 import tkinter as tk
 from tkinter import ttk
@@ -14,6 +18,7 @@ import numpy as np
 import sounddevice as sd
 
 import audio_devices
+from client_log import log_path, setup_logging
 from settings import load_settings, save_settings, settings_path, valid_relay_host
 from relay_config import RELAY_HOST, RELAY_PORT, RELAY_CERT_SHA256
 
@@ -21,6 +26,8 @@ from relay_config import RELAY_HOST, RELAY_PORT, RELAY_CERT_SHA256
 RATE = 48000
 BLOCK = 960  # 20 ms
 BYTES_PER_BLOCK = BLOCK * 2  # mono, signed 16-bit PCM
+MAX_RETRY_DELAY = 10
+logger = logging.getLogger("frincoms")
 
 
 def input_level(samples):
@@ -78,6 +85,13 @@ class VoiceApp:
         self.input_choices = []
         self.output_choices = []
         try:
+            setup_logging()
+            logger.info("Client started (platform=%s, frozen=%s)", sys.platform, bool(getattr(sys, "frozen", False)))
+        except OSError as exc:
+            # A read-only profile should not prevent the application from opening.
+            logging.basicConfig(level=logging.INFO)
+            logger.warning("Could not open diagnostic log: %s", exc)
+        try:
             self.settings = load_settings()
             if not settings_path().exists():
                 save_settings(self.settings)
@@ -85,6 +99,7 @@ class VoiceApp:
         except (OSError, ValueError) as exc:
             self.settings = None
             settings_error = f"Could not load relay settings: {exc}"
+            logger.exception("Settings could not be loaded")
 
         self.root.configure(background="#111827")
         style = ttk.Style(root)
@@ -156,6 +171,9 @@ class VoiceApp:
         ttk.Label(frame, textvariable=self.status, wraplength=360, style="Hint.TLabel").grid(
             row=14, column=0, columnspan=3, sticky="w", pady=(16, 0)
         )
+        self.log_button = ttk.Button(frame, text="Open diagnostic log", command=self.open_log,
+                                     style="Control.TButton")
+        self.log_button.grid(row=15, column=0, columnspan=3, sticky="w", pady=(12, 0))
         self.refresh_devices()
         if self.settings is None:
             self.connect_button.state(["disabled"])
@@ -175,6 +193,18 @@ class VoiceApp:
         colors = {"Connected": "#34d399", "Connecting": "#fbbf24", "Disconnected": "#f87171"}
         self.state_label.configure(foreground=colors[state])
 
+    def open_log(self):
+        path = log_path()
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(path))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except (OSError, AttributeError) as exc:
+            self.status.set(f"Log: {path} ({exc})")
+
     def post(self, generation, kind, message):
         self.events.put((generation, kind, message))
 
@@ -187,11 +217,17 @@ class VoiceApp:
                 if kind == "count":
                     self.people.set(f"{message} {'person' if message == 1 else 'people'} in room")
                     continue
+                if kind == "retry":
+                    self.people.set("0 people in room")
+                    self.set_connection_state("Connecting")
+                    self.status.set(message)
+                    continue
                 if kind == "audio_warning":
                     self.status.set(message)
                     continue
                 self.status.set(message)
                 if kind == "finished":
+                    logger.info("Call ended: %s", message)
                     self.set_running(False)
                     self.set_connection_state("Disconnected")
                     self.people.set("0 people in room")
@@ -218,8 +254,11 @@ class VoiceApp:
         stream = self.meter_stream
         self.meter_stream = None
         if stream is not None:
-            stream.stop()
-            stream.close()
+            try:
+                stream.stop()
+                stream.close()
+            except sd.PortAudioError:
+                logger.exception("Could not close microphone preview")
         self.mic_level = 0.0
 
     def start_meter_preview(self):
@@ -237,6 +276,7 @@ class VoiceApp:
             if "stream" in locals():
                 stream.close()
             self.status.set(f"Microphone level unavailable: {exc}")
+            logger.warning("Microphone preview unavailable: %s", exc)
 
     def on_preview_input(self, indata, frames, time_info, status):
         self.record_level(indata)
@@ -247,6 +287,7 @@ class VoiceApp:
             outputs = audio_devices.choices("output")
         except sd.PortAudioError as exc:
             self.status.set(f"Could not list audio devices: {exc}")
+            logger.warning("Audio device enumeration failed: %s", exc)
             return
         self.input_choices = inputs
         self.output_choices = outputs
@@ -267,6 +308,7 @@ class VoiceApp:
         if index < 0 or self.settings is None:
             return
         if self.persist({**self.settings, "input_device": self.input_choices[index][1]}):
+            logger.info("Input device selected: %s", self.input_choices[index][0])
             self.stop_meter_preview()
             self.start_meter_preview()
             self.status.set("Microphone saved. Reconnect to use it in the call.")
@@ -276,6 +318,7 @@ class VoiceApp:
         if index < 0 or self.settings is None:
             return
         if self.persist({**self.settings, "output_device": self.output_choices[index][1]}):
+            logger.info("Output device selected: %s", self.output_choices[index][0])
             self.status.set("Output saved. Reconnect to use it in the call.")
 
     def persist(self, data):
@@ -283,6 +326,7 @@ class VoiceApp:
             save_settings(data)
         except OSError as exc:
             self.status.set(f"Could not save settings: {exc}")
+            logger.exception("Could not save settings")
             return False
         self.settings = data
         return True
@@ -293,6 +337,7 @@ class VoiceApp:
             self.status.set("Enter an IP address or hostname, without a port or URL.")
             return
         if self.persist({**self.settings, "relay_host": host}):
+            logger.info("Relay address updated: %s", host)
             self.relay_address.delete(0, tk.END)
             self.relay_address.insert(0, host)
             self.status.set(f"Relay address saved: {host}. Used for the next connection.")
@@ -312,9 +357,10 @@ class VoiceApp:
             self.status.set("Relay certificate not configured.")
             return
         relay_host = self.settings["relay_host"]
+        logger.info("Connecting to relay %s:%s", relay_host, RELAY_PORT)
         self.status.set("Connecting to relay…")
         self.set_connection_state("Connecting")
-        self.start(lambda generation, stop: self.run_relay(generation, stop, relay_host))
+        self.start(lambda generation, stop: self.reconnect_loop(generation, stop, relay_host))
 
     def register(self, generation, field, value):
         with self.lock:
@@ -328,10 +374,29 @@ class VoiceApp:
             if self.active(generation) and getattr(self, field) is value:
                 setattr(self, field, None)
 
+    def reconnect_loop(self, generation, stop, relay_host):
+        delay = 1
+        last_connected = None
+        while not stop.is_set():
+            retry, connected = self.run_relay(generation, stop, relay_host)
+            if stop.is_set() or not retry:
+                return
+            if connected and not last_connected:
+                delay = 1
+            last_connected = connected
+            logger.info("Retrying relay connection in %s seconds", delay)
+            self.post(generation, "retry", f"Connection lost. Reconnecting in {delay}s…")
+            if stop.wait(delay):
+                return
+            self.post(generation, "retry", "Reconnecting to relay…")
+            delay = min(delay * 2, MAX_RETRY_DELAY)
+
     def run_relay(self, generation, stop, relay_host):
         connection = None
+        connected = False
         try:
             raw = socket.create_connection((relay_host, RELAY_PORT), timeout=5)
+            logger.info("TCP connected to relay")
             try:
                 # Pin the relay's self-signed certificate before sending audio.
                 context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -341,38 +406,48 @@ class VoiceApp:
                 fingerprint = hashlib.sha256(connection.getpeercert(binary_form=True)).hexdigest()
                 if not hmac.compare_digest(fingerprint, RELAY_CERT_SHA256):
                     raise ssl.SSLError("Relay certificate changed; connection refused")
+                logger.info("Relay TLS certificate verified")
             except Exception:
                 close_socket(connection or raw)
                 raise
-            connection.settimeout(1)
+            # TLS sockets with a short timeout can raise EAGAIN mid-record on
+            # macOS even while audio is flowing. Use blocking I/O for the call;
+            # Disconnect shuts down the socket to wake blocked readers/writers.
+            connection.settimeout(None)
             if not self.register(generation, "connection", connection):
-                return
+                return False, connected
             connection.sendall(b"C")
             response = receive_exact(connection, 1, stop)
             if response == b"W":
+                logger.info("Waiting for other participants")
                 self.post(generation, "connected", "Connected to relay. Waiting for others…")
                 self.post(generation, "count", 1)
                 response = receive_exact(connection, 1, stop)
             if response != b"P":
-                self.post(generation, "finished", "Relay refused the connection. Check that everyone has the latest app.")
-                return
+                logger.warning("Relay rejected connection (response=%r)", response)
+                return True, connected
             self.post(generation, "connected", "Connected — voice is live.")
+            logger.info("Voice call started")
+            connected = True
             audio_error = self.call(generation, stop, connection)
             if audio_error:
-                self.post(generation, "finished", f"Audio device error: {audio_error}")
-            elif not stop.is_set():
-                self.post(generation, "finished", "Relay disconnected. Click Connect to rejoin.")
+                logger.error("Audio device failed: %s", audio_error)
+                self.post(generation, "retry", f"Audio device error: {audio_error}. Reconnecting…")
         except (OSError, ConnectionError, sd.PortAudioError) as exc:
             if not stop.is_set():
-                self.post(generation, "finished", f"Connection failed: {exc}")
+                logger.exception("Connection failed")
+                self.post(generation, "retry", f"Connection failed: {exc}. Reconnecting…")
         finally:
             self.clear(generation, "connection", connection)
             close_socket(connection)
+            logger.info("Relay connection closed (requested=%s)", stop.is_set())
+        return True, connected
 
     def call(self, generation, stop, connection):
         outgoing = queue.Queue(maxsize=3)
         incoming = queue.Queue(maxsize=6)
         call_ended = threading.Event()
+        stream_warnings = queue.Queue()
 
         def enqueue_latest(target, block):
             try:
@@ -385,11 +460,15 @@ class VoiceApp:
                 target.put_nowait(block)
 
         def on_input(indata, frames, time_info, status):
+            if status:
+                stream_warnings.put(("input", str(status)))
             if not stop.is_set() and not call_ended.is_set():
                 self.record_level(indata)
                 enqueue_latest(outgoing, bytes(BYTES_PER_BLOCK) if self.muted else indata.tobytes())
 
         def on_output(outdata, frames, time_info, status):
+            if status:
+                stream_warnings.put(("output", str(status)))
             outdata.fill(0)
             if self.deafened:
                 return
@@ -407,8 +486,9 @@ class VoiceApp:
                     except queue.Empty:
                         continue
                     connection.sendall(block)
-            except OSError:
-                pass
+            except OSError as exc:
+                if not stop.is_set():
+                    logger.warning("Audio send stopped: %s", exc)
             finally:
                 call_ended.set()
 
@@ -420,14 +500,16 @@ class VoiceApp:
                         self.post(generation, "count", value)
                     else:
                         enqueue_latest(incoming, value)
-            except (OSError, ConnectionError):
-                pass
+            except (OSError, ConnectionError) as exc:
+                if not stop.is_set():
+                    logger.warning("Audio receive stopped: %s", exc)
             finally:
                 call_ended.set()
 
         try:
             input_device = audio_devices.resolve("input", self.settings["input_device"])
             output_device = audio_devices.resolve("output", self.settings["output_device"])
+            logger.info("Opening audio streams (input=%s, output=%s)", input_device, output_device)
             with sd.InputStream(samplerate=RATE, channels=1, dtype="int16", blocksize=BLOCK,
                                 device=input_device, callback=on_input), \
                  sd.OutputStream(samplerate=RATE, channels=1, dtype="int16", blocksize=BLOCK,
@@ -436,12 +518,19 @@ class VoiceApp:
                 threading.Thread(target=send, daemon=True).start()
                 threading.Thread(target=receive, daemon=True).start()
                 while not stop.is_set() and not call_ended.wait(0.1):
-                    pass
+                    while not stream_warnings.empty():
+                        direction, warning = stream_warnings.get_nowait()
+                        logger.warning("Audio %s stream: %s", direction, warning)
         except (sd.PortAudioError, ValueError) as exc:
+            logger.exception("Audio stream failed")
             return exc
         finally:
+            while not stream_warnings.empty():
+                direction, warning = stream_warnings.get_nowait()
+                logger.warning("Audio %s stream: %s", direction, warning)
             call_ended.set()
             self.mic_level = 0.0
+            logger.info("Audio streams stopped (requested=%s)", stop.is_set())
         return None
 
     def toggle_mute(self):
@@ -453,6 +542,7 @@ class VoiceApp:
         self.deafen_button.configure(text="Undeafen" if self.deafened else "Deafen")
 
     def disconnect(self):
+        logger.info("Disconnect requested")
         self.generation += 1
         with self.lock:
             if self.stop_event is not None:
@@ -468,6 +558,7 @@ class VoiceApp:
         self.start_meter_preview()
 
     def quit(self):
+        logger.info("Client closing")
         self.disconnect()
         self.stop_meter_preview()
         self.root.destroy()
